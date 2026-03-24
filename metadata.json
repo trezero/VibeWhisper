@@ -1,0 +1,5 @@
+{
+  "name": "VibeWhisper",
+  "description": "AI-powered voice dictation and refinement tool, inspired by Superwhisper and Vibetyper.",
+  "requestFramePermissions": ["microphone"]
+}
