@@ -4,7 +4,6 @@
  */
 
 import { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI } from "@google/genai";
 import { 
   Mic, 
   Square, 
@@ -21,9 +20,6 @@ import {
   Shield
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-
-// Initialize Gemini
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 type Vibe = 'raw' | 'natural' | 'professional' | 'concise' | 'creative' | 'casual';
 
@@ -93,24 +89,39 @@ export default function App() {
       return;
     }
 
+    if (typeof MediaRecorder === 'undefined') {
+      setError("This browser cannot record audio (MediaRecorder is unavailable).");
+      return;
+    }
+
+    if (!window.isSecureContext) {
+      setError("Microphone access requires a secure context. Open the app at http://localhost:3000.");
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       setPermissionStatus('granted');
       
-      // Check supported mime types
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm') 
-        ? 'audio/webm' 
-        : MediaRecorder.isTypeSupported('audio/mp4') 
-          ? 'audio/mp4' 
-          : '';
+      const mimeCandidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+        'audio/ogg;codecs=opus',
+      ];
+      const supportedMime = mimeCandidates.find((candidate) => MediaRecorder.isTypeSupported(candidate));
 
-      if (!mimeType) {
-        setError("No supported audio recording format found in this browser.");
+      let mediaRecorder: MediaRecorder;
+      try {
+        mediaRecorder = supportedMime ? new MediaRecorder(stream, { mimeType: supportedMime }) : new MediaRecorder(stream);
+      } catch (createErr) {
         stream.getTracks().forEach(track => track.stop());
+        console.error("Failed to initialize MediaRecorder:", createErr);
+        setError("Could not initialize microphone recording in this browser.");
         return;
       }
 
-      const mediaRecorder = new MediaRecorder(stream, { mimeType });
+      const mimeType = mediaRecorder.mimeType || supportedMime || 'audio/webm';
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
@@ -139,7 +150,21 @@ export default function App() {
         }
       };
 
+      mediaRecorder.onerror = (event) => {
+        console.error("MediaRecorder error:", event);
+        setError("Microphone recording failed. Please try again.");
+        setIsRecording(false);
+      };
+
       mediaRecorder.onstop = async () => {
+        if (audioChunksRef.current.length === 0) {
+          setError("No audio was captured. Please allow mic access and try again.");
+          if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+          if (audioContextRef.current) audioContextRef.current.close();
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
         processAudio(audioBlob, mimeType);
         
@@ -153,8 +178,17 @@ export default function App() {
       console.log("Recording started successfully");
     } catch (err) {
       console.error("Error accessing microphone:", err);
-      setPermissionStatus('denied');
-      setError("Microphone access denied. Please check your browser settings and allow access.");
+      const domErr = err as DOMException;
+      if (domErr?.name === 'NotAllowedError') {
+        setPermissionStatus('denied');
+        setError("Microphone access was blocked. Please allow mic access in your browser.");
+      } else if (domErr?.name === 'NotFoundError') {
+        setError("No microphone device was found on this system.");
+      } else if (domErr?.name === 'NotReadableError') {
+        setError("Microphone is busy or unavailable. Close other apps using it and try again.");
+      } else {
+        setError("Could not start recording. Check mic permissions and try again.");
+      }
     }
   };
 
@@ -170,49 +204,51 @@ export default function App() {
     console.log(`Processing audio blob of size ${blob.size} with type ${mimeType}`);
     setIsProcessing(true);
     setError(null);
+
     try {
-      const reader = new FileReader();
-      reader.readAsDataURL(blob);
-      reader.onloadend = async () => {
-        const base64Data = (reader.result as string).split(',')[1];
-        
-        const model = "gemini-3-flash-preview";
-        const prompt = selectedVibe === 'raw' 
-          ? `Transcribe this audio exactly as spoken. Return the response in JSON format: { "transcription": "...", "refined": "..." } where "refined" is the same as "transcription".`
-          : `Transcribe this audio accurately. Then, refine it to have a ${selectedVibe} vibe. 
-        Return the response in JSON format: { "transcription": "...", "refined": "..." }`;
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = () => reject(new Error("Failed to read recorded audio."));
+        reader.readAsDataURL(blob);
+      });
 
-        const response = await genAI.models.generateContent({
-          model,
-          contents: {
-            parts: [
-              { inlineData: { data: base64Data, mimeType } },
-              { text: prompt }
-            ]
-          },
-          config: {
-            responseMimeType: "application/json"
-          }
-        });
+      const base64Data = dataUrl.split(',')[1];
+      const response = await fetch('/api/process-audio', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          audioBase64: base64Data,
+          mimeType,
+          vibe: selectedVibe,
+        }),
+      });
 
-        const result = JSON.parse(response.text || '{}');
-        setTranscription(result.transcription || '');
-        setRefinedText(result.refined || '');
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || 'Local processing failed.');
+      }
 
-        if (result.transcription) {
-          const newEntry: Transcription = {
-            id: Date.now().toString(),
-            original: result.transcription,
-            refined: result.refined,
-            vibe: selectedVibe,
-            timestamp: Date.now()
-          };
-          setHistory(prev => [newEntry, ...prev].slice(0, 20));
-        }
-        setIsProcessing(false);
-      };
+      const result = await response.json();
+      setTranscription(result.transcription || '');
+      setRefinedText(result.refined || '');
+
+      if (result.transcription) {
+        const newEntry: Transcription = {
+          id: Date.now().toString(),
+          original: result.transcription,
+          refined: result.refined || result.transcription,
+          vibe: selectedVibe,
+          timestamp: Date.now()
+        };
+        setHistory(prev => [newEntry, ...prev].slice(0, 20));
+      }
     } catch (err) {
       console.error("Error processing audio:", err);
+      setError(err instanceof Error ? err.message : "Failed to process audio locally.");
+    } finally {
       setIsProcessing(false);
     }
   };
@@ -292,7 +328,7 @@ export default function App() {
                 <label className="text-[10px] font-mono uppercase tracking-widest text-zinc-500">Local GPU Status</label>
                 <div className="flex items-center gap-1.5">
                   <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                  <span className="text-[10px] font-mono text-green-500">RTX 3050 READY</span>
+                  <span className="text-[10px] font-mono text-green-500">LOCAL PIPELINE READY</span>
                 </div>
               </div>
               <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
@@ -363,7 +399,7 @@ export default function App() {
 
             <div className={`relative z-10 flex flex-col items-center gap-8 ${isRecording ? 'is-recording' : ''}`}>
               <div className="relative">
-                <div className="record-ring absolute -inset-4 border-2 border-zinc-800 rounded-full" />
+                <div className="record-ring pointer-events-none absolute -inset-4 border-2 border-zinc-800 rounded-full" />
                 <button
                   onClick={isRecording ? stopRecording : startRecording}
                   disabled={isProcessing}
@@ -371,7 +407,7 @@ export default function App() {
                     isRecording 
                       ? 'bg-red-500 scale-90 shadow-red-900/40' 
                       : 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/40'
-                  } ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  } ${isProcessing ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer active:scale-95'}`}
                 >
                   {isRecording ? (
                     <Square className="text-white w-8 h-8 fill-current" />
@@ -391,7 +427,7 @@ export default function App() {
                   ) : isRecording 
                     ? "Speak clearly. Your local GPU is optimizing the stream." 
                     : isProcessing 
-                    ? "Gemini is applying the " + selectedVibe + " vibe."
+                    ? "Applying the " + selectedVibe + " vibe locally."
                     : permissionStatus === 'denied'
                     ? "Microphone access is blocked. Please enable it in your browser."
                     : "Tap the button to start dictating your thoughts."}

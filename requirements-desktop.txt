@@ -1,0 +1,5 @@
+# System packages still required for tray mode:
+#   python3-gi python3-gi-cairo gir1.2-ayatanaappindicator3-0.1
+-r requirements-local.txt
+sounddevice>=0.5.2
+pynput>=1.8.1
